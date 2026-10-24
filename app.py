@@ -93,7 +93,8 @@ for name, ticker in assets.items():
             st.line_chart(data[["Close", "EMA20", "EMA50"]])
 
         except Exception as e:
-            st.error("Could not load this market. Check again later.")
+            st.error("f"Could not load {name}
+            {type(e).__name__}: {e}")
 
 st.divider()
 st.subheader("💰 Paper trading")
