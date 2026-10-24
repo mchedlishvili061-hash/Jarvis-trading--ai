@@ -1,8 +1,9 @@
 
 import os
 from datetime import datetime, timezone
-import yfinance as yf
+
 import pandas as pd
+import yfinance as yf
 from supabase import create_client
 
 ASSETS = {
@@ -17,10 +18,15 @@ STARTING_CASH = 100.0
 ALLOCATION = 0.20
 FEE_RATE = 0.001
 USER_KEY = "jarvis-main"
+MAX_SNAPSHOTS = 400
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def today_utc():
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def get_data(ticker):
@@ -31,6 +37,7 @@ def get_data(ticker):
         auto_adjust=True,
         progress=False,
     )
+
     if df.empty:
         return None
 
@@ -38,7 +45,10 @@ def get_data(ticker):
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
-    result = pd.DataFrame({"Close": close}).dropna()
+    result = pd.DataFrame({
+        "Close": pd.to_numeric(close, errors="coerce")
+    }).dropna()
+
     result["EMA20"] = result["Close"].ewm(
         span=20, adjust=False
     ).mean()
@@ -46,7 +56,18 @@ def get_data(ticker):
         span=50, adjust=False
     ).mean()
 
-    return result.dropna()
+    result = result.dropna()
+    return result if len(result) >= 2 else None
+
+
+def portfolio_value(state, prices):
+    value = float(state["cash"])
+
+    for ticker, pos in state["positions"].items():
+        price = prices.get(ticker, float(pos["entry"]))
+        value += float(pos["units"]) * price
+
+    return value
 
 
 def main():
@@ -62,23 +83,26 @@ def main():
         .execute()
     )
 
-    if response.data:
-        state = response.data[0]["data"]
-    else:
-        state = {
-            "cash": STARTING_CASH,
-            "positions": {},
-            "trades": [],
-        }
+    if not response.data:
+        raise RuntimeError(
+            "Saved portfolio not found. Refusing to create a new portfolio."
+        )
 
+    state = response.data[0].get("data")
+
+    if not isinstance(state, dict):
+        raise RuntimeError("Saved portfolio data is invalid.")
+
+    state = dict(state)
     state.setdefault("cash", STARTING_CASH)
     state.setdefault("positions", {})
     state.setdefault("trades", [])
+    state.setdefault("equity_snapshots", [])
 
-    # Avoid repeating the same daily trading cycle.
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = today_utc()
+
     if state.get("worker_last_day") == today:
-        print("Already processed today; no duplicate cycle.")
+        print("Already processed today; skipping duplicate cycle.")
         return
 
     prices = {}
@@ -87,35 +111,35 @@ def main():
     for name, ticker in ASSETS.items():
         try:
             df = get_data(ticker)
-            if df is not None and len(df) >= 2:
+            if df is not None:
                 data[ticker] = df
                 prices[ticker] = float(df["Close"].iloc[-1])
         except Exception as exc:
-            print(f"{name}: data error: {exc}")
+            print(f"{name}: data error: {type(exc).__name__}: {exc}")
 
     if not data:
-        raise RuntimeError("No market data retrieved; portfolio not changed.")
+        raise RuntimeError(
+            "No market data retrieved; portfolio was not changed."
+        )
 
+    # Execute the existing virtual EMA strategy.
     for name, ticker in ASSETS.items():
         if ticker not in data:
             continue
 
         df = data[ticker]
         price = prices[ticker]
-        bullish = float(df["EMA20"].iloc[-1]) > float(
-            df["EMA50"].iloc[-1]
-        )
+        last = df.iloc[-1]
+        bullish = float(last["EMA20"]) > float(last["EMA50"])
         pos = state["positions"].get(ticker)
 
         if bullish and pos is None:
-            equity = float(state["cash"])
-            for symbol, p in state["positions"].items():
-                equity += p["units"] * prices.get(symbol, p["entry"])
-
+            equity = portfolio_value(state, prices)
             budget = min(float(state["cash"]), equity * ALLOCATION)
+
             if budget > 1:
                 units = budget * (1 - FEE_RATE) / price
-                state["cash"] -= budget
+                state["cash"] = float(state["cash"]) - budget
                 state["positions"][ticker] = {
                     "name": name,
                     "entry": price,
@@ -130,12 +154,15 @@ def main():
                     "price": price,
                     "pnl": None,
                 })
-                print(f"Virtual BUY {name} at {price}")
+                print(f"Virtual BUY {name} at {price:.4f}")
 
         elif not bullish and pos is not None:
-            proceeds = pos["units"] * price * (1 - FEE_RATE)
-            pnl = proceeds - pos["cost"]
-            state["cash"] += proceeds
+            proceeds = (
+                float(pos["units"]) * price * (1 - FEE_RATE)
+            )
+            pnl = proceeds - float(pos["cost"])
+            state["cash"] = float(state["cash"]) + proceeds
+
             state["trades"].append({
                 "time": now(),
                 "asset": name,
@@ -143,9 +170,28 @@ def main():
                 "price": price,
                 "pnl": round(pnl, 2),
             })
-            del state["positions"][ticker]
-            print(f"Virtual SELL {name} at {price}; P/L {pnl:.2f}")
 
+            del state["positions"][ticker]
+            print(f"Virtual SELL {name} at {price:.4f}; P/L {pnl:.2f}")
+
+    # Save one daily portfolio snapshot for performance reporting.
+    equity = portfolio_value(state, prices)
+    snapshots = state.get("equity_snapshots", [])
+    if not isinstance(snapshots, list):
+        snapshots = []
+
+    snapshots = [
+        item for item in snapshots
+        if isinstance(item, dict) and item.get("day") != today
+    ]
+    snapshots.append({
+        "day": today,
+        "time": now(),
+        "equity": round(equity, 4),
+        "cash": round(float(state["cash"]), 4),
+    })
+
+    state["equity_snapshots"] = snapshots[-MAX_SNAPSHOTS:]
     state["worker_last_day"] = today
 
     db.table("paper_trading").upsert(
@@ -157,9 +203,9 @@ def main():
         on_conflict="user_key",
     ).execute()
 
-    print("Paper portfolio saved successfully.")
+    print(f"Portfolio saved. Equity: ${equity:.2f}")
+    print(f"Daily snapshot saved for {today}.")
 
 
 if __name__ == "__main__":
     main()
-
