@@ -93,7 +93,7 @@ for name, ticker in assets.items():
             st.line_chart(data[["Close", "EMA20", "EMA50"]])
 
         except Exception as e:
-    st.error(f"{name}: {type(e).__name__}: {e}")
+            st.error(f"{name}: {type(e).__name__}: {e}")
 
 st.divider()
 st.subheader("💰 Paper trading")
