@@ -9,7 +9,7 @@ from supabase import create_client
 st.set_page_config(
     page_title="JARVIS Trading AI",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
 )
 
 ASSETS = {
@@ -26,30 +26,60 @@ FEE_RATE = 0.001
 USER_KEY = "jarvis-main"
 
 
-# ---------- LOGIN ----------
+# ---------- TITLE ----------
 st.title("🤖 JARVIS TRADING AI")
 st.caption("Market analysis • Virtual paper trading only")
 st.warning("Simulation only. No real money or real orders are used.")
 
-try:
-    APP_PASSWORD = st.secrets["JARVIS_APP_PASSWORD"]
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_SECRET_KEY"]
-except Exception:
-    st.error(
-        "Missing Streamlit Secrets. Check JARVIS_APP_PASSWORD, "
-        "SUPABASE_URL and SUPABASE_SECRET_KEY."
+
+# ---------- SECRETS ----------
+required_secrets = [
+    "JARVIS_APP_PASSWORD",
+    "SUPABASE_URL",
+    "SUPABASE_SECRET_KEY",
+]
+
+missing = [
+    key for key in required_secrets
+    if key not in st.secrets or not str(st.secrets[key]).strip()
+]
+
+if missing:
+    st.error("Missing or empty Streamlit Secrets:")
+    for key in missing:
+        st.code(key)
+    st.info(
+        "Open Streamlit Cloud → your app → Settings → Secrets. "
+        "Add the missing value, save, then reboot the app."
     )
     st.stop()
 
+APP_PASSWORD = str(st.secrets["JARVIS_APP_PASSWORD"])
+SUPABASE_URL = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
+SUPABASE_SECRET_KEY = str(st.secrets["SUPABASE_SECRET_KEY"]).strip()
+
+if not SUPABASE_URL.startswith("https://"):
+    st.error("SUPABASE_URL must be your actual HTTPS Supabase Project URL.")
+    st.stop()
+
+
+# ---------- LOGIN ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    password = st.text_input("Enter JARVIS password", type="password")
+    with st.form("jarvis_login"):
+        password = st.text_input(
+            "JARVIS password",
+            type="password",
+        )
+        submitted = st.form_submit_button(
+            "Unlock JARVIS",
+            type="primary",
+        )
 
-    if st.button("Unlock JARVIS", type="primary"):
-        if password and password == APP_PASSWORD:
+    if submitted:
+        if password == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -58,16 +88,22 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-# ---------- SUPABASE ----------
+# ---------- DATABASE ----------
 @st.cache_resource
-def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+def get_supabase(url, key):
+    return create_client(url, key)
 
 
 try:
-    supabase = get_supabase()
+    supabase = get_supabase(
+        SUPABASE_URL,
+        SUPABASE_SECRET_KEY,
+    )
 except Exception:
-    st.error("Could not connect to the database. Check your Supabase Secrets.")
+    st.error(
+        "Could not initialize Supabase. Check the Project URL "
+        "and Secret Key in Streamlit Secrets."
+    )
     st.stop()
 
 
@@ -77,6 +113,22 @@ def empty_state():
         "positions": {},
         "trades": [],
     }
+
+
+def save_state(state):
+    payload = {
+        "user_key": USER_KEY,
+        "data": state,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    result = (
+        supabase.table("paper_trading")
+        .upsert(payload, on_conflict="user_key")
+        .execute()
+    )
+
+    return result
 
 
 def load_state():
@@ -90,6 +142,7 @@ def load_state():
 
     if result.data:
         saved = result.data[0].get("data")
+
         if isinstance(saved, dict):
             return {
                 "cash": float(saved.get("cash", STARTING_CASH)),
@@ -97,37 +150,28 @@ def load_state():
                 "trades": saved.get("trades", []),
             }
 
+    # No saved row yet: create the initial virtual portfolio.
     state = empty_state()
     save_state(state)
     return state
 
 
-def save_state(state):
-    payload = {
-        "user_key": USER_KEY,
-        "data": state,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    supabase.table("paper_trading").upsert(
-        payload,
-        on_conflict="user_key"
-    ).execute()
-
-
 if "db_loaded" not in st.session_state:
     try:
-        saved_state = load_state()
-        st.session_state.cash = saved_state["cash"]
-        st.session_state.positions = saved_state["positions"]
-        st.session_state.trades = saved_state["trades"]
+        state = load_state()
+        st.session_state.cash = state["cash"]
+        st.session_state.positions = state["positions"]
+        st.session_state.trades = state["trades"]
         st.session_state.db_loaded = True
-    except Exception:
-        st.error(
-            "Could not load/save paper-trading data. "
-            "Check that paper_trading has user_key, data and updated_at columns, "
-            "and that user_key has a unique index."
+
+    except Exception as exc:
+        st.error("Could not load or save the JARVIS portfolio.")
+        st.caption(
+            "Check that public.paper_trading contains user_key (text), "
+            "data (jsonb), and updated_at (timestamptz), and that "
+            "user_key has a unique index."
         )
+        st.code(f"{type(exc).__name__}: {str(exc)[:500]}")
         st.stop()
 
 
@@ -146,6 +190,7 @@ def get_market_data(ticker):
         return pd.DataFrame()
 
     close = raw["Close"]
+
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
@@ -169,23 +214,28 @@ def get_market_data(ticker):
     df["RSI"] = 100 - (100 / (1 + rs))
     df["Return30"] = df["Close"].pct_change(30) * 100
 
-    return df.dropna()
-
-
-def get_price(data):
-    return float(data["Close"].iloc[-1])
+    return df.replace([np.inf, -np.inf], np.nan).dropna()
 
 
 def portfolio_value(prices):
     value = float(st.session_state.cash)
 
     for ticker, pos in st.session_state.positions.items():
-        value += pos["units"] * prices.get(ticker, pos["entry"])
+        value += (
+            pos["units"]
+            * prices.get(ticker, pos["entry"])
+        )
 
     return value
 
 
-# ---------- OVERVIEW ----------
+def utc_now():
+    return datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+
+# ---------- MARKET OVERVIEW ----------
 st.subheader("📊 Market overview")
 
 if st.button("🔄 Refresh market data"):
@@ -201,17 +251,19 @@ for name, ticker in ASSETS.items():
         df = get_market_data(ticker)
 
         if df.empty or len(df) < 2:
-            errors.append(f"{name}: no data available")
+            errors.append(f"{name}: market data unavailable")
             continue
 
         market[ticker] = df
         last = df.iloc[-1]
         previous = df.iloc[-2]
-
-        price = get_price(df)
+        price = float(last["Close"])
         prices[ticker] = price
 
-        change = (price / float(previous["Close"]) - 1) * 100
+        change = (
+            price / float(previous["Close"]) - 1
+        ) * 100
+
         trend = (
             "Bullish"
             if last["EMA20"] > last["EMA50"]
@@ -222,7 +274,10 @@ for name, ticker in ASSETS.items():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Price", f"{price:,.4f}", f"{change:+.2f}%")
             c2.metric("RSI", f"{float(last['RSI']):.1f}")
-            c3.metric("30-day return", f"{float(last['Return30']):+.2f}%")
+            c3.metric(
+                "30-day return",
+                f"{float(last['Return30']):+.2f}%",
+            )
             c4.metric("EMA trend", trend)
             st.line_chart(df[["Close", "EMA20", "EMA50"]])
 
@@ -237,8 +292,8 @@ for error in errors:
 st.divider()
 st.subheader("💰 Virtual paper trading")
 st.caption(
-    "Strategy: buy when EMA20 is above EMA50; "
-    "sell when it is below. One position per asset."
+    "Daily EMA20/EMA50 strategy. One position per asset. "
+    "Signals are not guaranteed forecasts."
 )
 
 if st.button("▶️ Run paper-trading cycle", type="primary"):
@@ -257,28 +312,24 @@ if st.button("▶️ Run paper-trading cycle", type="primary"):
             equity = portfolio_value(prices)
             budget = min(
                 st.session_state.cash,
-                equity * ALLOCATION
+                equity * ALLOCATION,
             )
 
             if budget > 1:
                 fee = budget * FEE_RATE
                 units = (budget - fee) / price
-                st.session_state.cash -= budget
 
+                st.session_state.cash -= budget
                 st.session_state.positions[ticker] = {
                     "name": name,
                     "entry": price,
                     "units": units,
                     "cost": budget,
-                    "opened": datetime.now(
-                        timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC"),
+                    "opened": utc_now(),
                 }
 
                 st.session_state.trades.append({
-                    "time": datetime.now(
-                        timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC"),
+                    "time": utc_now(),
                     "asset": name,
                     "action": "BUY",
                     "price": price,
@@ -291,9 +342,7 @@ if st.button("▶️ Run paper-trading cycle", type="primary"):
             st.session_state.cash += proceeds
 
             st.session_state.trades.append({
-                "time": datetime.now(
-                    timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC"),
+                "time": utc_now(),
                 "asset": name,
                 "action": "SELL",
                 "price": price,
@@ -308,14 +357,16 @@ if st.button("▶️ Run paper-trading cycle", type="primary"):
             "positions": st.session_state.positions,
             "trades": st.session_state.trades,
         })
-        st.success("Paper-trading cycle completed and saved.")
-    except Exception:
-        st.error("Cycle ran, but saving to Supabase failed.")
+        st.success("Paper-trading cycle saved to Supabase.")
+
+    except Exception as exc:
+        st.error("Could not save the portfolio to Supabase.")
+        st.code(f"{type(exc).__name__}: {str(exc)[:500]}")
 
     st.rerun()
 
 
-# ---------- PORTFOLIO ----------
+# ---------- PORTFOLIO SUMMARY ----------
 positions = st.session_state.positions
 
 open_value = sum(
@@ -324,6 +375,8 @@ open_value = sum(
 )
 
 equity = st.session_state.cash + open_value
+pnl_total = equity - STARTING_CASH
+
 closed = [
     t for t in st.session_state.trades
     if t["action"] == "SELL" and t["pnl"] is not None
@@ -332,41 +385,47 @@ closed = [
 wins = sum(1 for t in closed if t["pnl"] > 0)
 losses = sum(1 for t in closed if t["pnl"] <= 0)
 win_rate = wins / len(closed) * 100 if closed else 0
-pnl_total = equity - STARTING_CASH
 
 a, b, c, d = st.columns(4)
 a.metric("Portfolio value", f"${equity:.2f}", f"{pnl_total:+.2f}")
 b.metric("Available cash", f"${st.session_state.cash:.2f}")
-c.metric("Total return", f"{pnl_total / STARTING_CASH * 100:+.2f}%")
+c.metric(
+    "Total return",
+    f"{pnl_total / STARTING_CASH * 100:+.2f}%",
+)
 d.metric(
     "Closed-trade win rate",
     f"{win_rate:.1f}%",
-    f"{wins} wins / {losses} losses"
+    f"{wins} wins / {losses} losses",
 )
 
+
+# ---------- OPEN POSITIONS ----------
 st.subheader("📌 Open positions")
 
 if positions:
     rows = []
 
-    for ticker, p in positions.items():
-        price = prices.get(ticker, p["entry"])
-        value = p["units"] * price
-        pnl = value - p["cost"]
+    for ticker, pos in positions.items():
+        price = prices.get(ticker, pos["entry"])
+        value = pos["units"] * price
+        pnl = value - pos["cost"]
 
         rows.append({
-            "Asset": p["name"],
-            "Entry price": round(p["entry"], 4),
+            "Asset": pos["name"],
+            "Entry price": round(pos["entry"], 4),
             "Latest price": round(price, 4),
             "Position value": round(value, 2),
             "Unrealized P/L": round(pnl, 2),
-            "P/L %": round(pnl / p["cost"] * 100, 2),
+            "P/L %": round(pnl / pos["cost"] * 100, 2),
         })
 
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 else:
     st.info("No open positions. Run a paper-trading cycle to check signals.")
 
+
+# ---------- TRADE HISTORY ----------
 st.subheader("🧾 Trade history")
 
 if st.session_state.trades:
@@ -377,11 +436,28 @@ if st.session_state.trades:
 else:
     st.info("No virtual trades yet.")
 
-st.caption(
-    "Signals use daily historical candles and are not guaranteed forecasts. "
-    "Paper-trading state is stored in Supabase."
-)
 
+# ---------- MANUAL SAVE ----------
+if st.button("💾 Save portfolio now"):
+    try:
+        save_state({
+            "cash": st.session_state.cash,
+            "positions": st.session_state.positions,
+            "trades": st.session_state.trades,
+        })
+        st.success("Portfolio saved.")
+    except Exception as exc:
+        st.error("Save failed.")
+        st.code(f"{type(exc).__name__}: {str(exc)[:500]}")
+
+
+# ---------- LOGOUT ----------
 if st.button("🔒 Lock JARVIS"):
     st.session_state.authenticated = False
     st.rerun()
+
+st.caption(
+    "Virtual trading only. Historical daily data may be delayed. "
+    "Supabase stores the paper portfolio between sessions; "
+    "this app does not place real trades."
+)
