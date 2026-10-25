@@ -5,6 +5,7 @@ Actions job) so the trading rules live in exactly one place.
 
 Paper trading only - no real orders are ever placed.
 """
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import numpy as np
@@ -118,93 +119,4 @@ def apply_cycle(state, data, prices):
 
     Signals come from the last completed candle; fills use the latest price.
     Returns (changes, actions) where `changes` holds the new cash,
-    positions and trades. The input state is not modified.
-    """
-    cash = float(state.get("cash", STARTING_CASH))
-    positions = {t: dict(p) for t, p in state.get("positions", {}).items()}
-    trades = list(state.get("trades", []))
-    actions = []
-
-    for name, ticker in ASSETS.items():
-        df = data.get(ticker)
-        price = prices.get(ticker)
-        if df is None or price is None:
-            continue
-
-        bullish = is_bullish(df)
-        if bullish is None:
-            continue
-
-        pos = positions.get(ticker)
-        if pos is not None:
-            pos["last_price"] = price
-
-        if bullish and pos is None:
-            equity = portfolio_value(cash, positions, prices)
-            budget = min(cash, equity * ALLOCATION)
-            if budget > 1:
-                units = budget * (1 - FEE_RATE) / price
-                cash -= budget
-                positions[ticker] = {
-                    "name": name,
-                    "entry": price,
-                    "units": units,
-                    "cost": budget,
-                    "opened": utc_now(),
-                    "last_price": price,
-                }
-                trades.append({
-                    "time": utc_now(),
-                    "asset": name,
-                    "action": "BUY",
-                    "price": price,
-                    "pnl": None,
-                })
-                actions.append(f"Virtual BUY {name} at {price:.4f}")
-
-        elif not bullish and pos is not None:
-            proceeds = float(pos["units"]) * price * (1 - FEE_RATE)
-            pnl = proceeds - float(pos["cost"])
-            cash += proceeds
-            trades.append({
-                "time": utc_now(),
-                "asset": name,
-                "action": "SELL",
-                "price": price,
-                "pnl": round(pnl, 2),
-            })
-            del positions[ticker]
-            actions.append(
-                f"Virtual SELL {name} at {price:.4f}; P/L {pnl:.2f}"
-            )
-
-    return {"cash": cash, "positions": positions, "trades": trades}, actions
-
-
-# ---------- REPORTING ----------
-
-def period_returns(history, initial_value, key):
-    """Profit/loss per period from end-of-period equity.
-
-    `history` needs an `equity` column plus the period column named by
-    `key` (for example "day" or "month"). Each period is compared with the
-    END of the previous period; the first period is compared with
-    `initial_value`.
-    """
-    history = history.sort_values("time")
-    ends = history.groupby(key, sort=True)["equity"].last()
-    starts = ends.shift(1)
-    starts.iloc[0] = float(initial_value)
-
-    out = pd.DataFrame({
-        key: ends.index,
-        "start": starts.values,
-        "end": ends.values,
-    })
-    out["P/L"] = out["end"] - out["start"]
-    out["P/L %"] = np.where(
-        out["start"] != 0,
-        out["P/L"] / out["start"] * 100,
-        0,
-    )
-    return out
+    positions and trades. The input state is
