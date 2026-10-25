@@ -8,7 +8,10 @@ from strategy import (
     ASSETS,
     STARTING_CASH,
     USER_KEY,
+    CRYPTO_TICKERS,
     apply_cycle,
+    get_crypto_candles,
+    get_crypto_quotes,
     get_data,
     get_live_quotes,
     is_bullish,
@@ -194,10 +197,37 @@ def get_market_data(ticker):
 # ---------- LIVE PANEL ----------
 @st.cache_data(ttl=10, show_spinner=False)
 def cached_live_quotes(tickers):
+    # Yahoo: stocks and forex (and crypto fallback).
     return get_live_quotes(tickers)
 
 
-LIVE_SECONDS = 15
+@st.cache_data(ttl=1, show_spinner=False)
+def cached_crypto_quotes(tickers):
+    # Coinbase: near-live crypto.
+    return get_crypto_quotes(tickers)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_candles(ticker):
+    # Coinbase asks apps not to poll candle history often.
+    return get_crypto_candles(ticker)
+
+
+STOCK_TICKERS = tuple(t for t in ASSETS.values() if t not in CRYPTO_TICKERS)
+
+
+def all_quotes():
+    """Coinbase for crypto, Yahoo for the rest (and as a crypto fallback)."""
+    quotes = dict(cached_live_quotes(STOCK_TICKERS))
+    crypto = cached_crypto_quotes(CRYPTO_TICKERS)
+    quotes.update(crypto)
+    missing = tuple(t for t in CRYPTO_TICKERS if t not in crypto)
+    if missing:
+        quotes.update(cached_live_quotes(missing))
+    return quotes
+
+
+LIVE_SECONDS = 2
 
 
 def live_dashboard():
@@ -207,7 +237,7 @@ def live_dashboard():
     the rest of the page.
     """
     live_state = st.session_state.jarvis_state
-    quotes = cached_live_quotes(tuple(ASSETS.values()))
+    quotes = all_quotes()
     live_prices = {t: q["price"] for t, q in quotes.items()}
 
     live_cash = float(live_state.get("cash", STARTING_CASH))
@@ -251,12 +281,26 @@ def live_dashboard():
         delta_color="off",
     )
 
-    st.markdown("**What's up and down** · change vs previous close")
+    st.markdown(
+        "**What's up and down** · stocks/forex vs previous close, "
+        "crypto vs 24 hours ago"
+    )
     movers = movers_table(quotes)
     if movers.empty:
         st.warning("Live prices unavailable right now; retrying.")
     else:
         st.dataframe(movers, use_container_width=True, hide_index=True)
+
+    st.markdown("**Live crypto chart** · 1-minute, last 3 hours")
+    coin_names = {t: n for n, t in ASSETS.items()}
+    coin_tabs = st.tabs([coin_names.get(t, t) for t in CRYPTO_TICKERS])
+    for tab, ticker in zip(coin_tabs, CRYPTO_TICKERS):
+        with tab:
+            candles = cached_candles(ticker)
+            if candles is None or candles.empty:
+                st.caption("Live chart unavailable right now.")
+            else:
+                st.line_chart(candles["Close"])
 
     st.markdown("**Open positions**")
     if live_positions:
@@ -273,9 +317,9 @@ def live_dashboard():
         st.caption("No live price for: " + ", ".join(missing_live))
     st.caption(
         f"Updated {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC · "
-        "Yahoo Finance data. Crypto and forex are near real-time; stocks "
-        "can be delayed ~15 minutes and show the last close when the "
-        "market is shut."
+        "Crypto: Coinbase, refreshed every few seconds. Stocks and forex: "
+        "Yahoo Finance, which can be delayed ~15 minutes and shows the "
+        "last close when the market is shut."
     )
 
 
@@ -431,7 +475,7 @@ st.caption(
 if st.button("▶️ Run paper-trading cycle", type="primary",
              use_container_width=True):
     # Daily candles give the signal; fills use the freshest live price.
-    live = cached_live_quotes(tuple(ASSETS.values()))
+    live = all_quotes()
     fill_prices = {**prices, **{t: q["price"] for t, q in live.items()}}
     changes, actions = apply_cycle(state, market, fill_prices)
     try:
