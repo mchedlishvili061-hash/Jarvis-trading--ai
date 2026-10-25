@@ -5,11 +5,13 @@ Actions job) so the trading rules live in exactly one place.
 
 Paper trading only - no real orders are ever placed.
 """
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 ASSETS = {
@@ -318,3 +320,86 @@ def positions_table(positions, prices):
 
     df = pd.DataFrame(rows).sort_values("_pnl", ascending=False)
     return df.drop(columns="_pnl")
+
+
+# ---------- FAST CRYPTO FEED (Coinbase public API, no key needed) ----------
+
+CRYPTO_TICKERS = ("BTC-USD", "ETH-USD")  # same ids on Coinbase and Yahoo
+COINBASE_URL = "https://api.exchange.coinbase.com"
+_HEADERS = {"User-Agent": "jarvis-trading-dashboard"}
+_STATS_CACHE = {}  # product -> (fetched_at, price 24h ago)
+
+
+def _cb_get(path, timeout=3):
+    response = requests.get(
+        COINBASE_URL + path, headers=_HEADERS, timeout=timeout
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _open_24h(product):
+    """Price 24h ago. Changes slowly, so it is cached for 60 seconds."""
+    cached = _STATS_CACHE.get(product)
+    if cached and time.monotonic() - cached[0] < 60:
+        return cached[1]
+    opened = float(_cb_get(f"/products/{product}/stats")["open"])
+    _STATS_CACHE[product] = (time.monotonic(), opened)
+    return opened
+
+
+def _fetch_crypto_quote(product):
+    try:
+        price = float(_cb_get(f"/products/{product}/ticker")["price"])
+        if price <= 0:
+            return None
+        try:
+            opened = _open_24h(product)
+        except Exception:
+            cached = _STATS_CACHE.get(product)
+            opened = cached[1] if cached else price
+        return {"price": price, "prev_close": opened}
+    except Exception:
+        return None
+
+
+def get_crypto_quotes(tickers=CRYPTO_TICKERS):
+    """Near-live crypto prices straight from Coinbase.
+
+    Same shape as get_live_quotes, but the change is measured against the
+    price 24 hours ago. Coins that fail are left out, so the caller can
+    fall back to Yahoo.
+    """
+    tickers = list(tickers)
+    if not tickers:
+        return {}
+
+    with ThreadPoolExecutor(max_workers=len(tickers)) as pool:
+        results = list(pool.map(_fetch_crypto_quote, tickers))
+
+    quotes = {}
+    for ticker, quote in zip(tickers, results):
+        if quote is None:
+            continue
+        prev = quote["prev_close"]
+        quote["change_pct"] = (quote["price"] / prev - 1) * 100 if prev else 0.0
+        quotes[ticker] = quote
+    return quotes
+
+
+def get_crypto_candles(product, minutes=180):
+    """Last `minutes` one-minute closes, or None if unavailable."""
+    try:
+        rows = _cb_get(f"/products/{product}/candles?granularity=60")
+        if not rows:
+            return None
+        # Each candle: [time, low, high, open, close, volume]
+        df = pd.DataFrame(
+            [row[:5] for row in rows],
+            columns=["time", "low", "high", "open", "close"],
+        )
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.sort_values("time").set_index("time")
+        return df[["close"]].rename(columns={"close": "Close"}).tail(minutes)
+    except Exception:
+        return None
