@@ -1,73 +1,24 @@
-
 import os
 from datetime import datetime, timezone
 
-import pandas as pd
-import yfinance as yf
 from supabase import create_client
 
-ASSETS = {
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-    "NVIDIA": "NVDA",
-    "S&P 500 ETF": "SPY",
-    "EUR/USD": "EURUSD=X",
-}
+from strategy import (
+    ASSETS,
+    STARTING_CASH,
+    USER_KEY,
+    apply_cycle,
+    get_data,
+    portfolio_value,
+    stale_tickers,
+    utc_now,
+)
 
-STARTING_CASH = 100.0
-ALLOCATION = 0.20
-FEE_RATE = 0.001
-USER_KEY = "jarvis-main"
 MAX_SNAPSHOTS = 400
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat()
 
 
 def today_utc():
     return datetime.now(timezone.utc).date().isoformat()
-
-
-def get_data(ticker):
-    df = yf.download(
-        ticker,
-        period="6mo",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-
-    if df.empty:
-        return None
-
-    close = df["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-
-    result = pd.DataFrame({
-        "Close": pd.to_numeric(close, errors="coerce")
-    }).dropna()
-
-    result["EMA20"] = result["Close"].ewm(
-        span=20, adjust=False
-    ).mean()
-    result["EMA50"] = result["Close"].ewm(
-        span=50, adjust=False
-    ).mean()
-
-    result = result.dropna()
-    return result if len(result) >= 2 else None
-
-
-def portfolio_value(state, prices):
-    value = float(state["cash"])
-
-    for ticker, pos in state["positions"].items():
-        price = prices.get(ticker, float(pos["entry"]))
-        value += float(pos["units"]) * price
-
-    return value
 
 
 def main():
@@ -82,14 +33,12 @@ def main():
         .limit(1)
         .execute()
     )
-
     if not response.data:
         raise RuntimeError(
             "Saved portfolio not found. Refusing to create a new portfolio."
         )
 
     state = response.data[0].get("data")
-
     if not isinstance(state, dict):
         raise RuntimeError("Saved portfolio data is invalid.")
 
@@ -100,14 +49,12 @@ def main():
     state.setdefault("equity_snapshots", [])
 
     today = today_utc()
-
     if state.get("worker_last_day") == today:
         print("Already processed today; skipping duplicate cycle.")
         return
 
     prices = {}
     data = {}
-
     for name, ticker in ASSETS.items():
         try:
             df = get_data(ticker)
@@ -122,60 +69,21 @@ def main():
             "No market data retrieved; portfolio was not changed."
         )
 
-    # Execute the existing virtual EMA strategy.
-    for name, ticker in ASSETS.items():
-        if ticker not in data:
-            continue
+    # Shared virtual EMA strategy (signal = last completed daily candle).
+    changes, actions = apply_cycle(state, data, prices)
+    state.update(changes)
+    for line in actions:
+        print(line)
 
-        df = data[ticker]
-        price = prices[ticker]
-        last = df.iloc[-1]
-        bullish = float(last["EMA20"]) > float(last["EMA50"])
-        pos = state["positions"].get(ticker)
+    # Daily snapshot. Positions with no fresh price today are valued at
+    # their last known price and flagged as stale instead of silently
+    # being valued at their entry price.
+    equity = portfolio_value(state["cash"], state["positions"], prices)
+    stale = stale_tickers(state["positions"], prices)
+    if stale:
+        print(f"Warning: no fresh price for {', '.join(stale)}; "
+              "using last known price in today's snapshot.")
 
-        if bullish and pos is None:
-            equity = portfolio_value(state, prices)
-            budget = min(float(state["cash"]), equity * ALLOCATION)
-
-            if budget > 1:
-                units = budget * (1 - FEE_RATE) / price
-                state["cash"] = float(state["cash"]) - budget
-                state["positions"][ticker] = {
-                    "name": name,
-                    "entry": price,
-                    "units": units,
-                    "cost": budget,
-                    "opened": now(),
-                }
-                state["trades"].append({
-                    "time": now(),
-                    "asset": name,
-                    "action": "BUY",
-                    "price": price,
-                    "pnl": None,
-                })
-                print(f"Virtual BUY {name} at {price:.4f}")
-
-        elif not bullish and pos is not None:
-            proceeds = (
-                float(pos["units"]) * price * (1 - FEE_RATE)
-            )
-            pnl = proceeds - float(pos["cost"])
-            state["cash"] = float(state["cash"]) + proceeds
-
-            state["trades"].append({
-                "time": now(),
-                "asset": name,
-                "action": "SELL",
-                "price": price,
-                "pnl": round(pnl, 2),
-            })
-
-            del state["positions"][ticker]
-            print(f"Virtual SELL {name} at {price:.4f}; P/L {pnl:.2f}")
-
-    # Save one daily portfolio snapshot for performance reporting.
-    equity = portfolio_value(state, prices)
     snapshots = state.get("equity_snapshots", [])
     if not isinstance(snapshots, list):
         snapshots = []
@@ -184,12 +92,15 @@ def main():
         item for item in snapshots
         if isinstance(item, dict) and item.get("day") != today
     ]
-    snapshots.append({
+    snapshot = {
         "day": today,
-        "time": now(),
+        "time": utc_now(),
         "equity": round(equity, 4),
         "cash": round(float(state["cash"]), 4),
-    })
+    }
+    if stale:
+        snapshot["stale"] = stale
+    snapshots.append(snapshot)
 
     state["equity_snapshots"] = snapshots[-MAX_SNAPSHOTS:]
     state["worker_last_day"] = today
@@ -198,7 +109,7 @@ def main():
         {
             "user_key": USER_KEY,
             "data": state,
-            "updated_at": now(),
+            "updated_at": utc_now(),
         },
         on_conflict="user_key",
     ).execute()
