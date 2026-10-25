@@ -10,10 +10,13 @@ from strategy import (
     USER_KEY,
     apply_cycle,
     get_data,
+    get_live_quotes,
     is_bullish,
+    movers_table,
     period_returns,
     portfolio_value,
     position_price,
+    positions_table,
     utc_now,
 )
 
@@ -188,10 +191,103 @@ def get_market_data(ticker):
     return get_data(ticker)
 
 
+# ---------- LIVE PANEL ----------
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_live_quotes(tickers):
+    return get_live_quotes(tickers)
+
+
+LIVE_SECONDS = 15
+
+
+def live_dashboard():
+    """Winning/losing banner, movers and open positions.
+
+    Runs as a fragment, so it refreshes by itself without reloading
+    the rest of the page.
+    """
+    live_state = st.session_state.jarvis_state
+    quotes = cached_live_quotes(tuple(ASSETS.values()))
+    live_prices = {t: q["price"] for t, q in quotes.items()}
+
+    live_cash = float(live_state.get("cash", STARTING_CASH))
+    live_positions = live_state.get("positions", {})
+    live_trades = live_state.get("trades", [])
+
+    equity = portfolio_value(live_cash, live_positions, live_prices)
+    start_value = float(live_state.get("starting_equity", STARTING_CASH))
+    total_pnl = equity - start_value
+    total_return = total_pnl / start_value * 100 if start_value else 0
+
+    unrealized = sum(
+        float(p["units"]) * position_price(t, p, live_prices) - float(p["cost"])
+        for t, p in live_positions.items()
+    )
+    closed = [
+        t for t in live_trades
+        if t.get("action") == "SELL" and t.get("pnl") is not None
+    ]
+    realized = sum(float(t["pnl"]) for t in closed)
+    wins = sum(1 for t in closed if float(t["pnl"]) > 0)
+    win_rate = wins / len(closed) * 100 if closed else 0
+
+    st.subheader("⚡ Live")
+    if total_pnl > 0:
+        st.success(f"🟢 Winning: {total_pnl:+,.2f} USD ({total_return:+.2f}%)")
+    elif total_pnl < 0:
+        st.error(f"🔴 At a loss: {total_pnl:+,.2f} USD ({total_return:+.2f}%)")
+    else:
+        st.info("⚪ Break-even so far.")
+
+    a, b = st.columns(2)
+    a.metric("Portfolio value", f"${equity:,.2f}", f"{total_pnl:+.2f} USD")
+    b.metric("Cash", f"${live_cash:,.2f}")
+    c, d = st.columns(2)
+    c.metric("Unrealized P/L", f"${unrealized:+,.2f}")
+    d.metric(
+        "Realized P/L",
+        f"${realized:+,.2f}",
+        f"{win_rate:.0f}% win rate" if closed else None,
+        delta_color="off",
+    )
+
+    st.markdown("**What's up and down** · change vs previous close")
+    movers = movers_table(quotes)
+    if movers.empty:
+        st.warning("Live prices unavailable right now; retrying.")
+    else:
+        st.dataframe(movers, use_container_width=True, hide_index=True)
+
+    st.markdown("**Open positions**")
+    if live_positions:
+        st.dataframe(
+            positions_table(live_positions, live_prices),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No open positions right now.")
+
+    missing_live = [n for n, t in ASSETS.items() if t not in quotes]
+    if missing_live:
+        st.caption("No live price for: " + ", ".join(missing_live))
+    st.caption(
+        f"Updated {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC · "
+        "Yahoo Finance data. Crypto and forex are near real-time; stocks "
+        "can be delayed ~15 minutes and show the last close when the "
+        "market is shut."
+    )
+
+
+live_on = st.toggle(
+    f"⚡ Live updates (every {LIVE_SECONDS} seconds)", value=True
+)
+st.fragment(run_every=LIVE_SECONDS if live_on else None)(live_dashboard)()
+
 st.divider()
 head_left, head_right = st.columns([2, 1])
 with head_left:
-    st.subheader("📊 Market watch")
+    st.subheader("📊 Daily charts & trend")
 with head_right:
     if st.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -256,74 +352,11 @@ st.caption(
 for error in errors:
     st.warning(error)
 
-# ---------- PORTFOLIO ----------
-st.divider()
-st.subheader("💰 Your portfolio")
-
-cash = float(state.get("cash", STARTING_CASH))
-positions = state.get("positions", {})
+# ---------- PORTFOLIO DATA (used by reports below) ----------
 trades = state.get("trades", [])
-
-equity = portfolio_value(cash, positions, prices)
-
-unrealized = 0.0
-for ticker, pos in positions.items():
-    current = position_price(ticker, pos, prices)
-    unrealized += float(pos["units"]) * current - float(pos["cost"])
-
-closed = [
-    trade for trade in trades
-    if trade.get("action") == "SELL" and trade.get("pnl") is not None
-]
-realized = sum(float(t["pnl"]) for t in closed)
-wins = sum(1 for t in closed if float(t["pnl"]) > 0)
-losses = sum(1 for t in closed if float(t["pnl"]) <= 0)
-win_rate = wins / len(closed) * 100 if closed else 0
-
 initial_value = float(state.get("starting_equity", STARTING_CASH))
-total_pnl = equity - initial_value
-total_return = total_pnl / initial_value * 100 if initial_value else 0
-
-c1, c2 = st.columns(2)
-c1.metric("Portfolio value", f"${equity:,.2f}", f"{total_pnl:+.2f} USD")
-c2.metric("Total return", f"{total_return:+.2f}%")
-
-c3, c4 = st.columns(2)
-c3.metric("Available cash", f"${cash:,.2f}")
-c4.metric("Unrealized P/L", f"${unrealized:+,.2f}")
-
-c5, c6 = st.columns(2)
-c5.metric("Realized P/L", f"${realized:+,.2f}")
-c6.metric(
-    "Closed trade win rate",
-    f"{win_rate:.1f}%",
-    f"{wins} wins / {losses} losses",
-)
 
 st.caption("Last database update: " + fmt_time(state.get("_db_updated_at")))
-
-# ---------- OPEN POSITIONS ----------
-st.subheader("📌 Open positions")
-
-if positions:
-    rows = []
-    for ticker, pos in positions.items():
-        current = position_price(ticker, pos, prices)
-        value = float(pos["units"]) * current
-        cost = float(pos["cost"])
-        pnl = value - cost
-        rows.append({
-            "Asset": pos.get("name", ticker),
-            "Entry": round(float(pos["entry"]), 4),
-            "Latest": round(current, 4),
-            "Position value": round(value, 2),
-            "Unrealized P/L": round(pnl, 2),
-            "P/L %": round(pnl / cost * 100, 2) if cost else 0,
-            "Opened": fmt_time(pos.get("opened")),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-else:
-    st.info("No open positions right now.")
 
 # ---------- DAILY / MONTHLY REPORTS ----------
 st.divider()
@@ -397,7 +430,10 @@ st.caption(
 
 if st.button("▶️ Run paper-trading cycle", type="primary",
              use_container_width=True):
-    changes, actions = apply_cycle(state, market, prices)
+    # Daily candles give the signal; fills use the freshest live price.
+    live = cached_live_quotes(tuple(ASSETS.values()))
+    fill_prices = {**prices, **{t: q["price"] for t, q in live.items()}}
+    changes, actions = apply_cycle(state, market, fill_prices)
     try:
         save_state(changes)
         st.success(
